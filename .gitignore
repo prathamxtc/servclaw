@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Environment & secrets
+.env
+.test*
+servclaw.json
+
+# Runtime data (auto-created on install/run)
+workspace/
+memory/
+logs/
+backup/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

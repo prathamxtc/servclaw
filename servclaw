@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+CONFIG_FILE="$ROOT_DIR/servclaw.json"
+COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Error: required command '$1' not found in PATH"
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Servclaw CLI
+
+Usage:
+  servclaw telegram allow <user-id>
+  servclaw discord allow <user-id>
+
+Commands:
+  telegram allow <user-id>   Add Telegram user ID to allowlist, update servclaw.json,
+                             and restart the servclaw container.
+  discord allow <user-id>    Add Discord user ID to allowlist, update servclaw.json,
+                             and restart the servclaw container.
+EOF
+}
+
+validate_user_id() {
+  local user_id="$1"
+  [[ "$user_id" =~ ^[0-9]+$ ]]
+}
+
+add_allowed_user() {
+  local user_id="$1"
+  require_cmd python3
+  python3 - "$CONFIG_FILE" "$user_id" <<'PY'
+import json, sys
+cfg_file, user_id = sys.argv[1], int(sys.argv[2])
+try:
+    with open(cfg_file, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+
+cfg.setdefault('channels', {}).setdefault('telegram', {})
+allowed = cfg['channels']['telegram'].setdefault('allowedUserIds', [])
+if not isinstance(allowed, list):
+    allowed = []
+if user_id not in [int(x) for x in allowed if str(x).isdigit()]:
+    allowed.append(user_id)
+cfg['channels']['telegram']['allowedUserIds'] = sorted({int(x) for x in allowed if str(x).isdigit()})
+
+with open(cfg_file, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+
+print('Allowed user IDs:', ','.join(str(x) for x in cfg['channels']['telegram']['allowedUserIds']))
+PY
+}
+
+add_discord_allowed_user() {
+  local user_id="$1"
+  require_cmd python3
+  python3 - "$CONFIG_FILE" "$user_id" <<'PY'
+import json, sys
+cfg_file, user_id = sys.argv[1], int(sys.argv[2])
+try:
+    with open(cfg_file, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+
+cfg.setdefault('channels', {}).setdefault('discord', {})
+allowed = cfg['channels']['discord'].setdefault('allowedUserIds', [])
+if not isinstance(allowed, list):
+    allowed = []
+if user_id not in [int(x) for x in allowed if str(x).isdigit()]:
+    allowed.append(user_id)
+cfg['channels']['discord']['allowedUserIds'] = sorted({int(x) for x in allowed if str(x).isdigit()})
+
+with open(cfg_file, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+
+print('Discord allowed user IDs:', ','.join(str(x) for x in cfg['channels']['discord']['allowedUserIds']))
+PY
+}
+
+restart_servclaw() {
+  require_cmd docker
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    echo "Error: docker-compose.yml not found at $COMPOSE_FILE"
+    exit 1
+  fi
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Error: servclaw.json not found at $CONFIG_FILE. Run ./install.sh first."
+    exit 1
+  fi
+
+  docker compose -f "$COMPOSE_FILE" --project-directory "$ROOT_DIR" up -d --build servclaw
+  docker compose -f "$COMPOSE_FILE" --project-directory "$ROOT_DIR" ps servclaw
+  echo "Servclaw restarted successfully."
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  case "$1" in
+    telegram)
+      if [[ $# -ne 3 || "$2" != "allow" ]]; then
+        usage
+        exit 1
+      fi
+      local user_id="$3"
+      if ! validate_user_id "$user_id"; then
+        echo "Error: user-id must be numeric"
+        exit 1
+      fi
+      add_allowed_user "$user_id"
+      restart_servclaw
+      ;;
+    discord)
+      if [[ $# -ne 3 || "$2" != "allow" ]]; then
+        usage
+        exit 1
+      fi
+      local user_id="$3"
+      if ! validate_user_id "$user_id"; then
+        echo "Error: user-id must be numeric"
+        exit 1
+      fi
+      add_discord_allowed_user "$user_id"
+      restart_servclaw
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
