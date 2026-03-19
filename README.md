@@ -135,6 +135,31 @@ docker compose restart servclaw      # restart after config changes
 
 ---
 
+## Bot Commands
+
+Send these directly in the chat (Telegram or Discord DM):
+
+| Command | What it does |
+|---------|-------------|
+| `/stop` | Immediately cancel whatever the agent is doing — kills the running command and frees the chat |
+| `/clear` | Wipe the in-memory session history. Useful if context gets confused |
+
+`/stop` is the kill switch. If the agent is stuck in a loop, running a long command, or waiting on something — just send `/stop` and it cancels cleanly.
+
+---
+
+## Onboarding
+
+On first run, the agent will walk you through a short setup: it reads `BOOTSTRAP.md` from its workspace and asks a few questions (your name, server role, preferences) to personalize itself.
+
+If it doesn't start automatically, just ask:
+
+> "Start onboarding process" or "let's do the setup"
+
+Onboarding is one-time. Once complete, `BOOTSTRAP.md` is deleted from the workspace and won't run again.
+
+---
+
 ## What Gets Created on First Run
 
 | Path | Purpose |

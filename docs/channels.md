@@ -14,6 +14,15 @@ servclaw telegram allow <user-id>
 servclaw telegram deny <user-id>
 ```
 
+**Bot commands:**
+
+| Command | Effect |
+|---------|--------|
+| `/stop` | Cancel the current execution immediately |
+| `/clear` | Clear in-memory session history |
+
+**Onboarding:** On first run the agent walks you through a short setup based on `BOOTSTRAP.md`. If it doesn't start on its own, just say "let's do the setup" or "introduce yourself".
+
 ---
 
 ## Discord
@@ -32,3 +41,12 @@ Servclaw operates via DMs only — no server channel required.
 servclaw discord allow <user-id>
 servclaw discord deny <user-id>
 ```
+
+**Bot commands:**
+
+| Command | Effect |
+|---------|--------|
+| `/stop` | Cancel the current execution immediately |
+| `/clear` | Clear in-memory session history |
+
+**Onboarding:** Same as Telegram — the agent reads `BOOTSTRAP.md` on first run and guides you through setup. If it doesn't kick off automatically, ask it to introduce itself.
