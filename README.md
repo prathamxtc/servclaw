@@ -15,7 +15,7 @@ An AI agent that runs on your server and manages your Docker infrastructure. Tal
 ## Setup
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/prathamxtc/servclaw
 cd servclaw
 bash install.sh
 ```
