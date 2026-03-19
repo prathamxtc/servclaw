@@ -27,6 +27,8 @@ The installer will:
 
 That's it. The agent is running.
 
+> If `servclaw` isn't found immediately, run `source ~/.profile` or open a new terminal.
+
 ---
 
 ## Configuration
