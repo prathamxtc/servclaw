@@ -135,6 +135,25 @@ docker compose restart servclaw      # restart after config changes
 
 ---
 
+## Command Safety & Confirmation
+
+The agent classifies every shell command it runs as **read-only** or **state-changing** before executing it:
+
+- **Read-only** (e.g. `ls`, `cat`, `docker ps`, `grep`, `df`) — runs immediately, no prompt.
+- **State-changing** (e.g. `rm`, `docker restart`, `apt install`, `chmod`, `systemctl stop`) — paused and sent to you for approval first.
+
+When a state-changing command is needed, you'll get a message like:
+
+> I want to run the following command on host:
+> ` docker restart nginx `
+> This could modify system state. Allow me to proceed?
+
+Reply **yes / allow / go ahead** to run it, or **no / deny / cancel** to skip it. On Telegram you also get inline **Allow / Deny** buttons.
+
+The model itself decides the classification — if it's unsure, it defaults to requiring confirmation.
+
+---
+
 ## Bot Commands
 
 Send these directly in the chat (Telegram or Discord DM):

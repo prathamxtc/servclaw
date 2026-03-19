@@ -1,5 +1,18 @@
 # Channels
 
+## Command Safety & Confirmation
+
+The agent classifies every command it executes as **read-only** or **state-changing**:
+
+- **Read-only** (`ls`, `cat`, `docker ps`, `grep`, `df`, …) — runs silently and immediately.
+- **State-changing** (`rm`, `docker restart`, `apt install`, `chmod`, `systemctl stop`, …) — paused until you approve.
+
+When a state-changing command is queued you'll receive a message with the exact command and a prompt to allow or deny. On Telegram this comes with inline **Allow / Deny** buttons. On Discord, reply `yes` / `no` (or any natural equivalent).
+
+The model decides the classification. When in doubt it defaults to asking. You can always approve the whole sequence in one go by saying *"yes go ahead"* after the first prompt — already-approved commands in that sequence won't be asked again.
+
+---
+
 ## Telegram
 
 The simplest way to use Servclaw.

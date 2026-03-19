@@ -317,6 +317,7 @@ install_global_command() {
       printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' > "$HOME/.profile"
     fi
     echo "Added $fallback_dir to PATH via ~/.profile (restart shell to pick up)."
+    export PATH="$fallback_dir:$PATH"
   fi
 }
 
@@ -375,5 +376,29 @@ log "Setup complete."
 echo "Check status:   ${COMPOSE_CMD[*]} ps"
 echo "View logs:      ${COMPOSE_CMD[*]} logs -f servclaw"
 echo
-echo "Authorize Telegram users after they message the bot and get their user ID:"
-echo "  servclaw telegram allow <user-id>"
+TELEGRAM_ENABLED=$(python3 -c "
+import json
+try:
+    c = json.load(open('$CONFIG_FILE'))
+    print('true' if c.get('channels',{}).get('telegram',{}).get('enabled') else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null)
+DISCORD_ENABLED=$(python3 -c "
+import json
+try:
+    c = json.load(open('$CONFIG_FILE'))
+    print('true' if c.get('channels',{}).get('discord',{}).get('enabled') else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null)
+
+if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
+  echo "Authorize Telegram users after they message the bot and get their user ID:"
+  echo "  servclaw telegram allow <user-id>"
+  echo
+fi
+if [[ "$DISCORD_ENABLED" == "true" ]]; then
+  echo "Authorize Discord users after they DM the bot and get their user ID:"
+  echo "  servclaw discord allow <user-id>"
+fi
