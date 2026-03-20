@@ -192,6 +192,13 @@ These are excluded from git automatically.
 
 ---
 
+## Feedback & Contributions
+
+Since Servclaw is in its early building phase, I’d love to hear your thoughts!
+
+- Found a bug? [Open an Issue](https://github.com/prathamxtc/servclaw/issues/new)
+- Want to chat or connect? [Twitter/X](https://twitter.com/prathamxtc)
+
 ## Docs
 
 - [Memory system](docs/memory.md)
