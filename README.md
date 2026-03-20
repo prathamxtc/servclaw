@@ -1,6 +1,6 @@
 # Servclaw
 
-An AI agent that runs on your server and manages your Docker infrastructure. Talk to it over Telegram or Discord — it can run commands, inspect containers, read logs, and remember context between sessions.
+An AI agent that runs on your server and manages your Docker infrastructure. Talk to it over Telegram or Discord - it can run commands, inspect containers, read logs, and remember context between sessions.
 
 ---
 
@@ -33,7 +33,7 @@ That's it. The agent is running.
 
 ## Configuration
 
-The installer handles everything interactively — API keys, bot tokens, and allowed users are all asked during setup.
+The installer handles everything interactively - API keys, bot tokens, and allowed users are all asked during setup.
 
 All settings are saved to `servclaw.json` at the project root. You can edit it directly later if needed:
 
@@ -99,9 +99,9 @@ The installer will ask if you want to enable Discord and prompt for your bot tok
 Before running the installer:
 1. Create a bot at [discord.com/developers](https://discord.com/developers)
 2. Under **Bot** settings, enable **Message Content Intent**
-3. Copy the bot token — the installer will ask for it
+3. Copy the bot token - the installer will ask for it
 
-The bot operates via DMs only — no server channel needed. Invite it to any server to be able to DM it.
+The bot operates via DMs only - no server channel needed. Invite it to any server to be able to DM it.
 
 **Easiest way to get your user ID:** after the bot is running, DM it once. If your ID isn't authorized, it will reply with your user ID. Then run:
 
@@ -139,8 +139,8 @@ docker compose restart servclaw      # restart after config changes
 
 The agent classifies every shell command it runs as **read-only** or **state-changing** before executing it:
 
-- **Read-only** (e.g. `ls`, `cat`, `docker ps`, `grep`, `df`) — runs immediately, no prompt.
-- **State-changing** (e.g. `rm`, `docker restart`, `apt install`, `chmod`, `systemctl stop`) — paused and sent to you for approval first.
+- **Read-only** (e.g. `ls`, `cat`, `docker ps`, `grep`, `df`) - runs immediately, no prompt.
+- **State-changing** (e.g. `rm`, `docker restart`, `apt install`, `chmod`, `systemctl stop`) - paused and sent to you for approval first.
 
 When a state-changing command is needed, you'll get a message like:
 
@@ -148,9 +148,9 @@ When a state-changing command is needed, you'll get a message like:
 > ` docker restart nginx `
 > This could modify system state. Allow me to proceed?
 
-Reply **yes / allow / go ahead** to run it, or **no / deny / cancel** to skip it. On Telegram you also get inline **Allow / Deny** buttons.
+Both Telegram and Discord show **Allow** and **Deny** buttons on this message. Tap **Allow** to proceed or **Deny** to cancel.
 
-The model itself decides the classification — if it's unsure, it defaults to requiring confirmation.
+The model itself decides the classification - if it's unsure, it defaults to requiring confirmation.
 
 ---
 
@@ -160,10 +160,10 @@ Send these directly in the chat (Telegram or Discord DM):
 
 | Command | What it does |
 |---------|-------------|
-| `/stop` | Immediately cancel whatever the agent is doing — kills the running command and frees the chat |
+| `/stop` | Immediately cancel whatever the agent is doing - kills the running command and frees the chat |
 | `/clear` | Wipe the in-memory session history. Useful if context gets confused |
 
-`/stop` is the kill switch. If the agent is stuck in a loop, running a long command, or waiting on something — just send `/stop` and it cancels cleanly.
+`/stop` is the kill switch. If the agent is stuck in a loop, running a long command, or waiting on something - just send `/stop` and it cancels cleanly.
 
 ---
 
