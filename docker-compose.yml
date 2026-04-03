@@ -7,15 +7,13 @@ services:
     restart: unless-stopped
     environment:
       DOCKER_SOCK: /var/run/docker.sock
-      SERVCLAW_COMMAND_LOG_PATH: /app/logs/commands.jsonl
+      SERVCLAW_COMMAND_LOG_PATH: /app/workspace/logs/commands.jsonl
       SERVCLAW_ENABLE_TERMINAL_REPL: "0"
     volumes:
       # Bind root config directly from host into container
       - ./servclaw.json:/app/servclaw.json
       # Let the agent inspect/manage host Docker through docker.sock
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persist command logs on the host
-      - ./logs:/app/logs
       # Persist long-term memory and active session context on the host
       - ./memory:/app/memory
       # Persist agent workspace (IDENTITY.md, USER.md, SOUL.md, etc.) on the host

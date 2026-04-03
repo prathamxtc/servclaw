@@ -340,7 +340,7 @@ ensure_docker_daemon
 WORKSPACE_DIR="$APP_DIR/workspace"
 TEMPLATES_DIR="$APP_DIR/templates"
 
-mkdir -p "$APP_DIR/logs" "$APP_DIR/memory" "$WORKSPACE_DIR"
+mkdir -p "$APP_DIR/memory" "$WORKSPACE_DIR" "$WORKSPACE_DIR/logs"
 
 # Copy template MDs to workspace if they don't exist
 if [[ -d "$TEMPLATES_DIR" ]]; then
