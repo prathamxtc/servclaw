@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "builtin": [
+    {
+      "id": "tavily_search",
+      "name": "Tavily Web Search",
+      "description": "Real-time web search via the Tavily API. Lets the agent search the internet for current information, recent events, and anything outside its training data.",
+      "module": "skills.tavily_search",
+      "requires_secret": "tavilyApiKey",
+      "docs": "https://docs.tavily.com",
+      "config_key": "tavily_search"
+    }
+  ]
+}
