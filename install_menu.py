@@ -20,7 +20,7 @@ from typing import Any
 def default_config() -> dict[str, Any]:
     return {
         "meta": {
-            "lastTouchedVersion": "2026.3.19",
+            "lastTouchedVersion": "2026.3.18",
         },
         "agents": {
             "defaults": {
@@ -39,10 +39,27 @@ def default_config() -> dict[str, Any]:
                 "token": "",
                 "allowedUserIds": [],
                 "streaming": "off",
-            }
+            },
+            "discord": {
+                "enabled": False,
+                "token": "",
+                "allowedUserIds": [],
+                "streaming": "off",
+            },
         },
         "secrets": {
             "openaiApiKey": "",
+            "tavilyApiKey": "",
+        },
+        "skills": {
+            "tavily_search": {
+                "enabled": False,
+            }
+        },
+        "user": {
+            "city": "",
+            "country": "",
+            "timezone": "",
         },
     }
 
@@ -247,6 +264,11 @@ def _channel_configured(existing: dict, channel: str) -> bool:
     return bool(get_string(existing, ["channels", channel.lower(), "token"]))
 
 
+def _skill_configured(existing: dict, skill_id: str) -> bool:
+    """Return True if the skill is currently enabled in the config."""
+    return bool(existing.get("skills", {}).get(skill_id, {}).get("enabled", False))
+
+
 def run_wizard(app_dir: Path, config_file: Path) -> int:
     existing = load_existing_config(config_file)
 
@@ -303,6 +325,35 @@ def run_wizard(app_dir: Path, config_file: Path) -> int:
     else:
         openai_api_key = existing_openai
 
+    # ── Step 3: Skills (optional built-in capabilities) ───────────────────
+    _SKIP = "Skip for now"
+    skills_options = ["Tavily Web Search", _SKIP]
+    skills_pre_checked = [
+        i for i, opt in enumerate(skills_options)
+        if opt == "Tavily Web Search" and _skill_configured(existing, "tavily_search")
+    ] or [skills_options.index(_SKIP)]  # default: Skip pre-checked
+
+    selected_skill_indices = menu_checkbox("Step 3: Skills", skills_options, default_checked=skills_pre_checked)
+    selected_skills = [skills_options[i] for i in selected_skill_indices if skills_options[i] != _SKIP]
+
+    tavily_api_key = get_string(existing, ["secrets", "tavilyApiKey"])
+    if "Tavily Web Search" in selected_skills:
+        if not tavily_api_key:
+            section_header("Tavily credentials")
+            tavily_api_key = prompt_required("API key (from app.tavily.com)")
+        else:
+            print(f"{CYAN}Tavily{RESET}    already configured — skipping.")
+
+    # ── User profile (name, city, country → timezone auto-derived) ────────
+    section_header("User Profile")
+    existing_name = get_string(existing, ["user", "name"]) or ""
+    existing_city = get_string(existing, ["user", "city"]) or ""
+    existing_country = get_string(existing, ["user", "country"]) or ""
+
+    user_name = input(f"Your name [{existing_name or 'optional'}]: ").strip() or existing_name
+    user_city = input(f"Your city [{existing_city or 'optional'}]: ").strip() or existing_city
+    user_country = input(f"Your country [{existing_country or 'optional'}]: ").strip() or existing_country
+
     # ── Write config ──────────────────────────────────────────────────────
     merged.setdefault("meta", {}).setdefault("lastTouchedVersion", "2026.3.19")
 
@@ -327,12 +378,44 @@ def run_wizard(app_dir: Path, config_file: Path) -> int:
         merged["channels"]["discord"]["token"] = discord_token
 
     merged.setdefault("secrets", {})["openaiApiKey"] = openai_api_key
+    merged["secrets"].setdefault("tavilyApiKey", "")
+    if tavily_api_key:
+        merged["secrets"]["tavilyApiKey"] = tavily_api_key
+
+    merged.setdefault("skills", {}).setdefault("tavily_search", {})
+    merged["skills"]["tavily_search"]["enabled"] = "Tavily Web Search" in selected_skills
+
+    # Save user profile and auto-derive timezone
+    user_section = merged.setdefault("user", {"city": "", "country": "", "timezone": ""})
+    if user_name:
+        user_section["name"] = user_name
+    if user_city:
+        user_section["city"] = user_city
+    if user_country:
+        user_section["country"] = user_country
 
     write_config(config_file, merged)
 
+    # Auto-derive timezone after config is written
+    if user_city or user_country:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(app_dir))
+            from servclaw_config import load_config as _lc, save_config as _sc, update_user_location as _ul
+            _cfg = _lc()
+            changed = _ul(_cfg, user_city, user_country)
+            if changed:
+                _sc(_cfg)
+                tz = _cfg.get("user", {}).get("timezone", "UTC")
+                print(f"{CYAN}\u2713 Timezone auto-detected: {tz}{RESET}")
+        except Exception:
+            pass
+
+    active_skills = selected_skills if selected_skills else ["none"]
     print(f"\n{CYAN}Setup complete.{RESET}")
     print(f"  Active:    {', '.join(selected_channels)}")
     print(f"  Provider:  {provider_name}")
+    print(f"  Skills:    {', '.join(active_skills)}")
     print(f"  Config:    {config_file}")
     print()
     return 0
