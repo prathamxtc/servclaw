@@ -52,6 +52,17 @@ def default_config() -> dict[str, Any]:
         },
         "secrets": {
             "openaiApiKey": "",
+            "tavilyApiKey": "",
+        },
+        "skills": {
+            "tavily_search": {
+                "enabled": False,
+            },
+        },
+        "user": {
+            "city": "",
+            "country": "",
+            "timezone": "",
         },
     }
 
@@ -85,6 +96,132 @@ def save_config(cfg: dict[str, Any]) -> None:
     if "lastTouchedVersion" not in cfg["meta"]:
         cfg["meta"]["lastTouchedVersion"] = "2026.3.18"
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def _city_country_to_timezone(city: str, country: str) -> str | None:
+    """Auto-derive IANA timezone from city+country using pytz.country_timezones.
+
+    Single-timezone countries (India, Japan, etc.) resolve immediately.
+    Multi-timezone countries (US, Australia) try to match city against
+    the IANA city component (e.g. "New_York" → "America/New_York").
+    Returns the IANA string or None if nothing could be matched.
+    """
+    try:
+        import pytz
+    except ImportError:
+        return None
+
+    lower_country = (country or "").strip().lower()
+    iso_code: str | None = None
+    if lower_country:
+        for code, name in pytz.country_names.items():
+            n = name.lower()
+            if n == lower_country or lower_country in n or n in lower_country:
+                iso_code = code
+                break
+    if not iso_code:
+        return None
+
+    tzs: list[str] = pytz.country_timezones.get(iso_code, [])
+    if not tzs:
+        return None
+    if len(tzs) == 1:
+        return tzs[0]
+
+    # Multiple zones: match the city component of the IANA name
+    city_norm = (city or "").strip().lower().replace(" ", "_")
+    if city_norm:
+        for tz in tzs:
+            tz_city = tz.split("/", 1)[-1].lower()
+            if city_norm in tz_city or tz_city in city_norm:
+                return tz
+        city_spaced = city_norm.replace("_", " ")
+        for tz in tzs:
+            tz_city = tz.split("/", 1)[-1].lower().replace("_", " ")
+            if city_spaced in tz_city or tz_city in city_spaced:
+                return tz
+
+    return tzs[0]  # best guess: country's primary/first zone
+
+
+def get_user_timezone(cfg: dict[str, Any]) -> str:
+    """Return the user's IANA timezone — fully automatic, no user input needed.
+
+    Lookup order:
+    1. cfg.user.timezone (already saved)
+    2. Auto-derived from cfg.user.city + cfg.user.country (+ saves back to cfg)
+    3. workspace/USER.md Timezone field (legacy onboarding path)
+    4. "UTC" fallback
+    """
+    user = cfg.get("user", {})
+    tz = (user.get("timezone") or "").strip()
+    if tz:
+        return tz
+
+    city = (user.get("city") or "").strip()
+    country = (user.get("country") or "").strip()
+    if city or country:
+        derived = _city_country_to_timezone(city, country)
+        if derived:
+            cfg.setdefault("user", {})["timezone"] = derived
+            save_config(cfg)
+            return derived
+
+    # Legacy: try workspace/USER.md for users set up before location tracking
+    workspace_user_md = Path(__file__).resolve().parent / "workspace" / "USER.md"
+    if workspace_user_md.exists():
+        try:
+            import re as _re
+            content = workspace_user_md.read_text(encoding="utf-8")
+            m = _re.search(r"Timezone\s*:\s*`?([A-Za-z][A-Za-z/_+-]+)`?", content)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate.lower() not in ("unset", "none", "(unset)", "utc"):
+                    try:
+                        from zoneinfo import ZoneInfo
+                        ZoneInfo(candidate)
+                        cfg.setdefault("user", {})["timezone"] = candidate
+                        save_config(cfg)
+                        return candidate
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return "UTC"
+
+
+def update_user_location(cfg: dict[str, Any], city: str, country: str) -> bool:
+    """Save city/country to cfg and auto-derive+store timezone.
+
+    Modifies cfg in-place. Returns True if anything changed.
+    Caller is responsible for calling save_config(cfg) afterwards.
+    """
+    user = cfg.setdefault("user", {})
+    city = (city or "").strip()
+    country = (country or "").strip()
+    changed = False
+    if city and user.get("city") != city:
+        user["city"] = city
+        changed = True
+    if country and user.get("country") != country:
+        user["country"] = country
+        changed = True
+    # Re-derive timezone whenever city or country changes, or if timezone is missing
+    if changed or not user.get("timezone"):
+        derived = _city_country_to_timezone(
+            city or user.get("city", ""),
+            country or user.get("country", ""),
+        )
+        if derived and user.get("timezone") != derived:
+            user["timezone"] = derived
+            changed = True
+    return changed
+
+
+def get_skill_config(cfg: dict[str, Any], skill_id: str) -> dict[str, Any]:
+    """Return the config block for a skill, e.g. cfg['skills']['tavily_search']."""
+    return dict(cfg.get("skills", {}).get(skill_id, {}))
 
 
 def get_openai_api_key(cfg: dict[str, Any]) -> str:
