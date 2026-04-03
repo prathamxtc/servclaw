@@ -20,6 +20,7 @@ Key subsystems:
   - Model name          — read from servclaw.json (agents.defaults.model.primary) at startup
 """
 
+import importlib
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
 # Strip ANSI escape codes from raw PTY output before passing to LLM
 _ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -77,8 +78,17 @@ def _looks_like_input_prompt(text: str) -> bool:
 
 from openai import OpenAI
 
+from custom_skill_manager import CustomSkillManager
 from memory_manager import MemoryManager
-from servclaw_config import get_model_name, get_openai_api_key, load_config
+from servclaw_config import (
+    get_model_name,
+    get_openai_api_key,
+    get_skill_config,
+    get_user_timezone,
+    load_config,
+    save_config,
+    update_user_location,
+)
 
 
 class ExecutionStopped(Exception):
@@ -115,9 +125,17 @@ $HOME in container is /root. User's home is /home/<username> (check memory or as
 SYSTEM_TOOL_RULES = """## Tool & Execution Rules
 - Interactive commands: when run_command returns {"waiting_for_input": true}, call send_process_input. If input is user-specific (password, key), ask user FIRST. Never fabricate secrets.
 - Workspace files: ALWAYS workspace_read before workspace_write. Preserve all frontmatter/headings. Never rewrite from scratch.
-- Execution tracking: for 2+ tool-call tasks, call execution_plan() first, then execution_update() after each step. Record key facts (ports, paths, configs) as notes.
+- Execution tracking: for 2+ tool-call tasks, call execution_plan() first, then execution_update() after each step. Record key facts (discoveries, paths, results) as notes.
 - Always call tools for fresh data. When you have the answer, give it — do NOT re-run commands already ran.
-- Large command output is automatically summarized by a sub-model before you see it. You will see {auto_summarized: true} when this happens. Trust the summary — it captures the key content."""
+- Large command output is automatically summarized by a sub-model before you see it. You will see {auto_summarized: true} when this happens. Trust the summary — it captures the key content.
+- Shell commands are for automation, file tasks, or system queries the user actually requests — not for general knowledge questions.
+- Command history/logs: use logs_read("commands.jsonl") to inspect past commands, their outputs, and approval decisions. Default is last 30 — adjust limit as needed (e.g. limit=5 for a quick glance, limit=100 for deep history).
+- Background jobs: use job_create, job_update, job_cancel, job_list for ALL watch/monitor/reminder/alert/scheduled tasks. Choose kind='direct_message' for simple reminders (pre-written text, no LLM at fire time) and kind='agent_task' for checks that need your brain at fire time. Never use shell commands, scripts, or external CLI tools to create or manage background jobs.
+- Job deduplication (CRITICAL): ALWAYS call job_list before job_create. If a job already exists for the same intent (same time, same purpose), use job_update or job_cancel+job_create to replace it — never create a second overlapping job. When the user refines a request ("make it variable", "send on Discord"), that means UPDATE the existing job, not create a new one alongside it. One intent = one job.
+- Jobs are the ONLY mechanism for reminders, schedules, and recurring tasks. NEVER use workspace files (REMINDERS.md, SCHEDULE.md, or any .md) to record or track jobs — that does nothing. The job system (job_create/list/update/cancel) is the single source of truth. Do not write job metadata to workspace files.
+- Job timezones: ALWAYS pass timezone (IANA name, e.g. 'Asia/Kolkata') when creating or updating cron/run_once jobs. Derive it from user_timezone in msg_context. Never leave times as UTC unless the user explicitly says "UTC". If msg_context has no timezone but has a country/city, infer the correct IANA timezone yourself (e.g. India → 'Asia/Kolkata', UK → 'Europe/London').
+- Custom skills: use skill_create to build a new reusable Python tool whenever the user asks you to automate or create a capability. Use skill_list/skill_read to review existing skills. Use skill_update to improve them. Newly created/updated skills are immediately callable in the next message as normal tools.
+- message_user: call it AT MOST ONCE per execution in case of Jobs. Draft the message carefully, then send it — never call it again to rephrase the same content. If a background job fired late (device was offline), just perform the task normally; do NOT send extra messages explaining why it ran late."""
 
 SYSTEM_STYLE = """## Response Style & Rules
 - Short, natural messages. 1-3 sentences. One thought per message.
@@ -342,28 +360,331 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "logs_read",
+            "description": (
+                "Read command execution logs. Each line in 'commands.jsonl' is a JSON record with "
+                "fields: ts (timestamp), event, command, exit_code, output, approved, etc. "
+                "Returns the last `limit` entries (default 30). Set limit to any number you need — "
+                "use a small number for a quick glance, larger for deeper history. No confirmation needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Log file to read (e.g. 'commands.jsonl').",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many most-recent log entries to return. Defaults to 30.",
+                    },
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_create",
+            "description": (
+                "Create a background job. Two kinds:\n"
+                "• direct_message — You pre-write the exact message now. At fire time it is sent directly "
+                "to the user's channels with NO LLM call. Use for reminders, nudges, scheduled messages.\n"
+                "• agent_task — At fire time YOUR brain is invoked in the background. You can use tools, "
+                "run commands, think, and decide whether to contact the user. Use for checks, monitoring, "
+                "anything that needs intelligence at fire time.\n"
+                "Schedule modes: heartbeat (repeating interval), cron (cron expression), run_once (one-shot)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "direct_message (pre-written text, no LLM) or agent_task (LLM brain at fire time).",
+                        "enum": ["direct_message", "agent_task"],
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable purpose of this job.",
+                    },
+                    "schedule_mode": {
+                        "type": "string",
+                        "description": "heartbeat (periodic), cron (cron expression), or run_once (single fire).",
+                        "enum": ["heartbeat", "cron", "run_once"],
+                    },
+                    "interval_minutes": {
+                        "type": "integer",
+                        "description": "Interval for heartbeat jobs (minutes). Minimum 1.",
+                    },
+                    "cron": {
+                        "type": "string",
+                        "description": "Cron expression for schedule_mode='cron'.",
+                    },
+                    "run_at": {
+                        "type": "string",
+                        "description": "ISO datetime for schedule_mode='run_once'.",
+                    },
+                    "cancel_after_run": {
+                        "type": "boolean",
+                        "description": "Auto-remove after one execution. Defaults true for run_once.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "(direct_message only) The exact message text to send when the job fires.",
+                    },
+                    "channels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "(direct_message only) Target channels e.g. ['telegram']. Empty = all.",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "(agent_task only) Optional shell command to pre-run before the LLM check. "
+                            "Output is passed to the agent brain for analysis."
+                        ),
+                    },
+                    "context_mode": {
+                        "type": "string",
+                        "description": "(agent_task only) contextual (includes recent conversation) or isolated.",
+                        "enum": ["contextual", "isolated"],
+                    },
+                },
+                "required": ["kind", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_cancel",
+            "description": "Cancel and remove a background job by its ID. Use job_list first to find IDs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job ID to cancel (e.g. 'job_abc123').",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_update",
+            "description": (
+                "Update an existing job's settings. Only provided fields change. "
+                "Use job_list first to get the ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job ID to update.",
+                    },
+                    "description": {"type": "string"},
+                    "schedule_mode": {
+                        "type": "string",
+                        "enum": ["heartbeat", "cron", "run_once"],
+                    },
+                    "interval_minutes": {"type": "integer"},
+                    "cron": {"type": "string"},
+                    "run_at": {"type": "string"},
+                    "cancel_after_run": {"type": "boolean"},
+                    "message": {"type": "string", "description": "New message text (direct_message jobs)."},
+                    "channels": {"type": "array", "items": {"type": "string"}},
+                    "command": {"type": "string", "description": "New command. Empty string removes it."},
+                    "context_mode": {"type": "string", "enum": ["contextual", "isolated"]},
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "job_list",
+            "description": (
+                "List all background jobs with their IDs, kinds, descriptions, schedules, and status. "
+                "Use to review jobs or find IDs before cancelling/updating."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "message_user",
+            "description": (
+                "You can use this any time you want to reach out to the user or initiate conversation with "
+                "the user, such as to share important information, ask a question, or deliver a monitor alert "
+                "through their messaging channel(s). By default sends to ALL active channels. "
+                "To target a specific channel pass its name in 'channels' (e.g. ['telegram'])."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message text to send.",
+                    },
+                    "channels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional channel names to target, e.g. ['telegram']. "
+                            "Omit or pass an empty list to send to ALL active channels."
+                        ),
+                    },
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "channels_list",
+            "description": (
+                "List the communication channels configured in servclaw.json with their enabled status and "
+                "whether each channel is currently active/registered for push delivery. "
+                "Use when you need to know which channels are available, active, or enabled."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_create",
+            "description": (
+                "Create a new custom skill (a Python tool callable by you in future conversations). "
+                "Skills live in workspace/skills/<tool_name>/. Each skill has:\n"
+                "  • skill.py  — Python module you write; MUST define:\n"
+                "      TOOL_SCHEMA = {\"type\":\"function\",\"function\":{\"name\":\"<tool_name>\","
+                "\"description\":\"...\",\"parameters\":{\"type\":\"object\",\"properties\":{...},"
+                "\"required\":[]}}}\n"
+                "      def run(args: dict) -> dict: ...\n"
+                "  • SKILL.md  — Markdown guide: when and how to use this skill.\n"
+                "The skill is loaded immediately and available as a tool from the next message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": (
+                            "Unique identifier for this skill/tool. "
+                            "Lowercase letters, digits, underscores only. Must start with a letter. "
+                            "E.g. 'ping_host', 'disk_usage', 'git_summary'."
+                        ),
+                    },
+                    "skill_code": {
+                        "type": "string",
+                        "description": (
+                            "Full content of skill.py. Must define TOOL_SCHEMA and run(args: dict) -> dict. "
+                            "Do NOT import Servclaw internals — skills must be self-contained."
+                        ),
+                    },
+                    "skill_guide": {
+                        "type": "string",
+                        "description": "Markdown content for SKILL.md — when and how to use this skill.",
+                    },
+                },
+                "required": ["tool_name", "skill_code", "skill_guide"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_update",
+            "description": (
+                "Update an existing custom skill's code and/or guide. "
+                "Provide only the fields you want to change. The skill is reloaded immediately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "description": "The tool name of the skill to update."},
+                    "skill_code": {"type": "string", "description": "New full content for skill.py."},
+                    "skill_guide": {"type": "string", "description": "New full content for SKILL.md."},
+                },
+                "required": ["tool_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_delete",
+            "description": "Permanently delete a custom skill and its files from workspace/skills/<tool_name>/.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "description": "The tool name of the skill to delete."},
+                },
+                "required": ["tool_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_list",
+            "description": (
+                "List all custom skills currently stored in workspace/skills/. "
+                "Shows tool names, descriptions, and file paths."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_read",
+            "description": "Read the full code (skill.py) and guide (SKILL.md) of a custom skill.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "description": "The tool name of the skill to read."},
+                },
+                "required": ["tool_name"],
+            },
+        },
+    },
 ]
 
-MEMORY_PLANNER_PROMPT = """You are a memory action planner for a local assistant.
+MEMORY_PLANNER_PROMPT = """You are a memory action planner for a personal AI assistant.
 
 Goal: produce minimal, accurate edits for memory/memory.md as CURRENT TRUTH.
 
 Rules:
 - Do not invent facts.
-- If user asks to remember something, add a concise note.
+- If user asks to remember something, add a concise note using remember_note.
+- If user mentions a task, goal, or thing they need to do — even casually (e.g. "I need to fix X", "remember I have to update Y", "don't forget I want to do Z") — add a remember_note for it. These are pending to-dos the user wants to persist across sessions.
 - If user asks to forget something specific, remove only matching memory.
 - If user asks to forget everything about themselves, clear user memory.
 - If user says vague forget words like "forget it/this/that", remove only the most recent remembered note, not all user memory.
 - Prefer updating existing facts over appending conflicting ones.
+- IMPORTANT: When the user mentions their country or city (even casually, e.g. "my country", "I'm in India", "I live in Mumbai"), always capture it using set_user_info with key="Country" and/or key="City". This is used to auto-set timezone for scheduling.
 - Output JSON only with this shape:
     {
         "actions": [
-            {"type":"set_user_info","key":"Name","value":"Pratham"},
+            {"type":"set_user_info","key":"Name","value":"Alex"},
+            {"type":"set_user_info","key":"Country","value":"India"},
+            {"type":"set_user_info","key":"City","value":"Mumbai"},
             {"type":"remove_user_info","key":"Preference[pizza]"},
-            {"type":"remember_note","note":"user likes music"},
-            {"type":"remove_session_note","snippet":"music"},
-            {"type":"set_infrastructure_note","key":"Deployment stage","value":"prod"},
-            {"type":"remove_infrastructure_note","snippet":"old value"},
+            {"type":"remember_note","note":"user likes jazz music"},
+            {"type":"remove_session_note","snippet":"jazz"},
             {"type":"forget_all_user_memory"},
             {"type":"forget_last_remembered"}
         ]
@@ -420,12 +741,16 @@ class ServclawAgent:
         self.client = OpenAI(api_key=get_openai_api_key(cfg))
         self.memory = MemoryManager()
         self._running_in_docker = self._detect_running_in_docker()
+        # Workspace dir must be set before _command_log_path default
+        self._workspace_dir = Path(__file__).resolve().parent / "workspace"
+        self._workspace_dir.mkdir(parents=True, exist_ok=True)
         self._command_log_path = Path(
             os.getenv(
                 "SERVCLAW_COMMAND_LOG_PATH",
-                str(Path(__file__).resolve().parent / "logs" / "commands.jsonl"),
+                str(self._workspace_dir / "logs" / "commands.jsonl"),
             )
         )
+        (self._workspace_dir / "logs").mkdir(parents=True, exist_ok=True)
         self._command_log_lock = threading.Lock()
         self._command_logger = logging.getLogger("servclaw.commands")
         if not self._command_logger.handlers:
@@ -447,13 +772,291 @@ class ServclawAgent:
         # Optional status callback: called with a short string before each tool run.
         # Set externally (e.g. by Telegram bot) to stream live progress to the user.
         self._status_callback: "callable | None" = None
-        # Workspace directory (contains SOUL.md, IDENTITY.md, USER.md, BOOTSTRAP.md, etc.)
-        self._workspace_dir = Path(__file__).resolve().parent / "workspace"
-        self._workspace_dir.mkdir(parents=True, exist_ok=True)
+        # _workspace_dir already set above; just create remaining dirs
         self._workspace_lock = threading.Lock()
         self._channels_dir = Path(__file__).resolve().parent / "channels"
+        # Skills system
+        self._tools: list = list(TOOLS)
+        self._skill_handlers: dict = {}
+        self._skill_guides: list[str] = []
+        self._load_skills(cfg)
+        self._builtin_skill_guide_count = len(self._skill_guides)
+        # Custom (user-created) skills
+        self._custom_skills = CustomSkillManager(self._workspace_dir)
+        self._custom_skills.load_all()
+        self._skill_guides.extend(self._custom_skills.get_guides())
+        # Scheduler (set by main.py after construction)
+        self.scheduler: Any = None
+        # Channel push handlers: name → callable(text)
+        self._channel_push_handlers: dict = {}
         # Ensure workspace files are initialized from templates
         self._ensure_workspace_templates()
+
+    # ── Skills ────────────────────────────────────────────────────────────
+
+    def _load_skills(self, cfg: dict) -> None:
+        """Read skills/manifest.json, import each enabled skill, and register its tool."""
+        skills_dir = Path(__file__).resolve().parent / "skills"
+        manifest_path = skills_dir / "manifest.json"
+        if not manifest_path.exists():
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for skill_def in manifest.get("builtin", []):
+            skill_id = skill_def.get("id", "")
+            skill_cfg = cfg.get("skills", {}).get(skill_id, {})
+            if not skill_cfg.get("enabled", False):
+                continue
+            req_secret = skill_def.get("requires_secret")
+            api_key = ""
+            if req_secret:
+                api_key = str(cfg.get("secrets", {}).get(req_secret, "") or "")
+                if not api_key:
+                    logging.warning("[skills] %s enabled but secret '%s' is empty — skipping", skill_id, req_secret)
+                    continue
+            try:
+                mod = importlib.import_module(skill_def["module"])
+                tool_name = mod.TOOL_SCHEMA["function"]["name"]
+                self._tools.append(mod.TOOL_SCHEMA)
+                self._skill_handlers[tool_name] = lambda args, _k=api_key, _m=mod: _m.execute(args, _k)
+                skill_md_path = skills_dir / skill_id / "skill.md"
+                if skill_md_path.exists():
+                    guide = skill_md_path.read_text(encoding="utf-8").strip()
+                    if guide:
+                        self._skill_guides.append(guide)
+                logging.info("[skills] loaded: %s (%s)", skill_id, tool_name)
+            except Exception as e:
+                logging.warning("[skills] failed to load %s: %s", skill_id, e)
+
+    def _refresh_custom_skill_guides(self) -> None:
+        """Rebuild _skill_guides to reflect current custom skills."""
+        builtin_count = getattr(self, "_builtin_skill_guide_count", 0)
+        self._skill_guides = self._skill_guides[:builtin_count] + self._custom_skills.get_guides()
+
+    # ── Logs ──────────────────────────────────────────────────────────────
+
+    def _logs_read(self, filename: str, limit: int = 30) -> dict:
+        """Read the last `limit` lines from a log file in workspace/logs/."""
+        safe = Path(filename).name
+        logs_dir = self._workspace_dir / "logs"
+        filepath = logs_dir / safe
+        if not filepath.exists():
+            return {"error": f"Log file not found: {safe}"}
+        try:
+            lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = lines[-limit:] if limit > 0 else lines
+            return {"content": "\n".join(tail), "total_entries": len(lines), "returned": len(tail)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ── Location sync ─────────────────────────────────────────────────────
+
+    def _sync_location_to_config(self, actions: list[dict]) -> None:
+        """If memory actions recorded Country or City, save them to servclaw.json."""
+        country = next(
+            (a.get("value") for a in actions
+             if a.get("type") == "set_user_info"
+             and a.get("key", "").strip().lower() in ("country",)),
+            None,
+        )
+        city = next(
+            (a.get("value") for a in actions
+             if a.get("type") == "set_user_info"
+             and a.get("key", "").strip().lower() in ("city",)),
+            None,
+        )
+        if not country and not city:
+            return
+        try:
+            cfg = load_config()
+            changed = update_user_location(cfg, city or "", country or "")
+            if changed:
+                save_config(cfg)
+                tz = cfg.get("user", {}).get("timezone", "UTC")
+                logging.info("[agent] user location synced to config: country=%s city=%s tz=%s",
+                             country, city, tz)
+        except Exception:
+            pass
+
+    # ── Channel push ──────────────────────────────────────────────────────
+
+    def register_channel_push(self, name: str, handler) -> None:
+        """Register a per-channel push callable so the agent can target specific channels."""
+        self._channel_push_handlers[name.lower()] = handler
+
+    def _tool_message_user(self, message: str, channels: list) -> dict:
+        """Send a message through channels. Used by the message_user tool."""
+        if not message:
+            return {"error": "message is required"}
+        if not self._channel_push_handlers:
+            return {"error": "no active push channels are registered — channels may not be set up yet"}
+        if getattr(self._execution_local, "monitor_mode", False):
+            mid = getattr(self._execution_local, "monitor_id", None)
+            if mid and self.scheduler is not None:
+                if not self.scheduler.job_exists(mid):
+                    logging.info("[message_user] dropped: job %s was cancelled mid-flight", mid)
+                    return {"skipped": f"job {mid} was cancelled — message not sent"}
+        targets = [c.lower() for c in channels] if channels else list(self._channel_push_handlers.keys())
+        sent, failed = [], []
+        for ch in targets:
+            handler = self._channel_push_handlers.get(ch)
+            if handler is None:
+                failed.append(f"{ch} (not registered)")
+                continue
+            try:
+                handler(message)
+                sent.append(ch)
+            except Exception as exc:
+                failed.append(f"{ch} (error: {exc})")
+        if sent:
+            self.memory.add_message("assistant", message)
+        return {"sent_to": sent, "failed": failed}
+
+    def send_to_channels(self, message: str, channels: list[str]) -> dict:
+        """Public API for the scheduler to send messages through channels."""
+        if not message:
+            return {"sent_to": [], "failed": ["no message"]}
+        if not self._channel_push_handlers:
+            return {"sent_to": [], "failed": ["no channels registered"]}
+        targets = [c.lower() for c in channels] if channels else list(self._channel_push_handlers.keys())
+        sent, failed = [], []
+        for ch in targets:
+            handler = self._channel_push_handlers.get(ch)
+            if handler is None:
+                failed.append(f"{ch} (not registered)")
+                continue
+            try:
+                handler(message)
+                sent.append(ch)
+            except Exception as exc:
+                failed.append(f"{ch} (error: {exc})")
+        return {"sent_to": sent, "failed": failed}
+
+    def _tool_channels_list(self) -> dict:
+        """Return configured channels from servclaw.json with enabled + push-active status."""
+        cfg = load_config()
+        channels_cfg = cfg.get("channels", {})
+        result = []
+        for ch_name in ("telegram", "discord"):
+            ch = channels_cfg.get(ch_name, {})
+            result.append({
+                "name": ch_name,
+                "enabled": ch.get("enabled", True),
+                "push_active": ch_name in self._channel_push_handlers,
+            })
+        return {"channels": result}
+
+    # ── Monitor check (called by scheduler) ──────────────────────────────
+
+    def monitor_check(self, prompt: str, context_mode: str = "contextual", monitor_id: str | None = None) -> None:
+        """Called by Scheduler for agent_task jobs — runs the full tool loop in background."""
+        exec_id = f"job:{uuid.uuid4().hex[:8]}"
+        self._set_current_execution_id(exec_id)
+        self._clear_execution_cancelled(exec_id)
+        self._execution_local.monitor_mode = True
+        self._execution_local.monitor_id = monitor_id
+
+        _BLOCKED_TOOLS = {"job_create"}
+        restricted_tools = [t for t in self._tools if t["function"]["name"] not in _BLOCKED_TOOLS]
+
+        mode = (context_mode or "contextual").strip().lower()
+        if mode not in {"contextual", "isolated"}:
+            mode = "contextual"
+
+        system_prompt = (
+            "You are Servclaw, the user's infrastructure assistant running a background task.\n"
+            "Do the task described. Use your tools freely.\n"
+            "If something needs the user's attention → call message_user() with your message.\n"
+            "If everything is normal → finish silently without calling message_user.\n"
+            "Message style when notifying: first line of a conversation you are opening — "
+            "natural, warm, direct, as if you just walked up to start a chat. "
+            "No REMINDER/ALERT/FYI labels. One thought only.\n"
+            "DO NOT use sudo or privileged commands. DO NOT create new background jobs."
+        )
+
+        try:
+            self._clear_scratchpad()
+            recent = self.memory.get_recent_messages()
+            convo_lines: list[str] = []
+            for item in recent:
+                role = item.get("role")
+                content = item.get("content")
+                if role not in {"user", "assistant"}:
+                    continue
+                if not isinstance(content, str):
+                    continue
+                text = content.strip()
+                if not text:
+                    continue
+                prefix = "USER" if role == "user" else "ASSISTANT"
+                clipped = text if len(text) <= 220 else text[:217] + "..."
+                convo_lines.append(f"- {prefix}: {clipped}")
+            convo_lines = convo_lines[-8:]
+            convo_snapshot = (
+                "Recent conversation (use for tone and continuity — not as evidence of new events):\n"
+                + "\n".join(convo_lines)
+            ) if convo_lines else "Recent conversation: (none)"
+
+            messages = [
+                {"role": "system", "content": SYSTEM_CORE},
+                {"role": "system", "content": SYSTEM_TOOL_RULES},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            if mode == "contextual":
+                messages.insert(3, {"role": "system", "content": convo_snapshot})
+            self._run_tool_loop(messages, _tools_override=restricted_tools)
+            self._maybe_refresh_session_memory()
+        except Exception:
+            logging.exception("[monitor_check] error for %s", exec_id)
+        finally:
+            self._execution_local.monitor_mode = False
+            self._execution_local.monitor_id = None
+            self._clear_current_execution_id()
+
+    # ── Custom skill tools ────────────────────────────────────────────────
+
+    def _tool_skill_create(self, tool_name: str, skill_code: str, skill_guide: str) -> dict:
+        if not tool_name:
+            return {"error": "tool_name is required"}
+        if not skill_code:
+            return {"error": "skill_code is required"}
+        if not skill_guide:
+            return {"error": "skill_guide is required"}
+        result = self._custom_skills.create(tool_name, skill_code, skill_guide)
+        if result.get("ok"):
+            self._refresh_custom_skill_guides()
+            logging.info("[agent] custom skill created: %s", tool_name)
+        return result
+
+    def _tool_skill_update(self, tool_name: str, skill_code: str | None, skill_guide: str | None) -> dict:
+        if not tool_name:
+            return {"error": "tool_name is required"}
+        result = self._custom_skills.update(tool_name, skill_code, skill_guide)
+        if result.get("ok"):
+            self._refresh_custom_skill_guides()
+            logging.info("[agent] custom skill updated: %s", tool_name)
+        return result
+
+    def _tool_skill_delete(self, tool_name: str) -> dict:
+        if not tool_name:
+            return {"error": "tool_name is required"}
+        result = self._custom_skills.delete(tool_name)
+        if result.get("ok"):
+            self._refresh_custom_skill_guides()
+            logging.info("[agent] custom skill deleted: %s", tool_name)
+        return result
+
+    def _tool_skill_list(self) -> dict:
+        skills = self._custom_skills.list_skills()
+        return {"custom_skills": skills, "count": len(skills)}
+
+    def _tool_skill_read(self, tool_name: str) -> dict:
+        if not tool_name:
+            return {"error": "tool_name is required"}
+        return self._custom_skills.read_skill(tool_name)
 
     def _log_command_event(self, event: str, **fields) -> None:
         payload = {
@@ -829,6 +1432,32 @@ class ServclawAgent:
             return f"📋 Planning {count} tasks"
         if name == "execution_update":
             return None  # silent — don't spam status for internal tracking
+        if name in {"job_create", "job_cancel", "job_list", "job_update"}:
+            return None  # silent — let agent reply naturally after tool completes
+        if name == "tavily_web_search":
+            query = args.get("query", "")
+            label = query if len(query) <= 80 else query[:77] + "…"
+            return f"🔎 Searching web: {label}"
+        if name == "message_user":
+            msg = args.get("message", "")
+            preview = msg if len(msg) <= 60 else msg[:57] + "…"
+            chans = args.get("channels") or []
+            target = f" → {', '.join(chans)}" if chans else " → all channels"
+            return f"💬 Messaging{target}: {preview}"
+        if name == "channels_list":
+            return "📡 Checking configured channels"
+        if name == "skill_create":
+            return f"🔨 Creating skill `{args.get('tool_name', '?')}`"
+        if name == "skill_update":
+            return f"✏️ Updating skill `{args.get('tool_name', '?')}`"
+        if name == "skill_delete":
+            return f"🗑️ Deleting skill `{args.get('tool_name', '?')}`"
+        if name == "skill_list":
+            return None  # silent
+        if name == "skill_read":
+            return f"📖 Reading skill `{args.get('tool_name', '?')}`"
+        if self._custom_skills.is_skill(name):
+            return f"⚙️ Running `{name}`"
         return f"⚙️ {name}"
 
     def _tool_done_label(self, name: str, args: dict, result_json: str) -> str | None:
@@ -875,6 +1504,29 @@ class ServclawAgent:
 
         if name in {"execution_plan", "execution_update"}:
             return None  # silent — internal tracking
+
+        if name in {"job_create", "job_cancel", "job_update", "job_list"}:
+            return None  # silent — let agent reply naturally
+
+        if name == "message_user":
+            sent = result.get("sent_to", [])
+            failed = result.get("failed", [])
+            if sent:
+                return f"✓ Message sent → {', '.join(sent)}"
+            if failed:
+                return f"✗ Message failed → {', '.join(failed)}"
+            return "✓ Message sent"
+
+        if name == "channels_list":
+            return None  # silent
+
+        if name in {"skill_create", "skill_update", "skill_delete"}:
+            if result.get("error"):
+                return f"✗ {result['error']}"
+            return f"✓ Skill `{args.get('tool_name', '?')}` updated"
+
+        if name in {"skill_list", "skill_read"}:
+            return None  # silent
 
         return "✓ Done"
 
@@ -1018,6 +1670,84 @@ class ServclawAgent:
                 args.get("status", "done"),
                 args.get("note"),
             )
+        elif name == "logs_read":
+            result = self._logs_read(args.get("filename", "commands.jsonl"), args.get("limit", 30))
+        elif name == "job_create":
+            if self.scheduler is None:
+                result = {"error": "scheduler is not running"}
+            else:
+                job = self.scheduler.add_job(
+                    kind=args.get("kind", "agent_task"),
+                    description=args.get("description", ""),
+                    schedule_mode=args.get("schedule_mode", "heartbeat"),
+                    interval_minutes=int(args.get("interval_minutes", 15) or 15),
+                    cron=args.get("cron"),
+                    run_at=args.get("run_at"),
+                    cancel_after_run=args.get("cancel_after_run"),
+                    message=args.get("message"),
+                    channels=args.get("channels"),
+                    command=args.get("command"),
+                    context_mode=args.get("context_mode"),
+                )
+                from datetime import datetime, timezone as _tz
+                fires_at = job.get("next_run_at")
+                human_time = ""
+                if fires_at:
+                    try:
+                        dt = datetime.fromisoformat(fires_at.replace("Z", "+00:00"))
+                        mins = round((dt - datetime.now(_tz.utc)).total_seconds() / 60)
+                        human_time = f"in about {mins} minute{'s' if mins != 1 else ''}" if mins > 0 else "shortly"
+                    except Exception:
+                        pass
+                result = {
+                    "ok": True,
+                    "job_id": job.get("id"),
+                    "kind": job.get("kind"),
+                    "scheduled": human_time or "as requested",
+                    "mode": job.get("schedule_mode", "heartbeat"),
+                    "cancel_after_run": job.get("cancel_after_run", False),
+                }
+        elif name == "job_cancel":
+            if self.scheduler is None:
+                result = {"error": "scheduler is not running"}
+            else:
+                ok = self.scheduler.cancel_job(args.get("job_id", ""))
+                result = {"ok": ok, "job_id": args.get("job_id", "")} if ok else {"error": "job not found", "job_id": args.get("job_id", "")}
+        elif name == "job_update":
+            if self.scheduler is None:
+                result = {"error": "scheduler is not running"}
+            else:
+                updated = self.scheduler.update_job(args.get("job_id", ""), **{
+                    k: v for k, v in args.items() if k != "job_id"
+                })
+                result = updated if updated is not None else {"error": "job not found"}
+        elif name == "job_list":
+            if self.scheduler is None:
+                result = {"jobs": [], "note": "scheduler is not running"}
+            else:
+                result = {"jobs": self.scheduler.list_jobs()}
+        elif name == "message_user":
+            result = self._tool_message_user(args.get("message", ""), args.get("channels") or [])
+        elif name == "channels_list":
+            result = self._tool_channels_list()
+        elif name == "skill_create":
+            result = self._tool_skill_create(
+                args.get("tool_name", ""), args.get("skill_code", ""), args.get("skill_guide", "")
+            )
+        elif name == "skill_update":
+            result = self._tool_skill_update(
+                args.get("tool_name", ""), args.get("skill_code"), args.get("skill_guide")
+            )
+        elif name == "skill_delete":
+            result = self._tool_skill_delete(args.get("tool_name", ""))
+        elif name == "skill_list":
+            result = self._tool_skill_list()
+        elif name == "skill_read":
+            result = self._tool_skill_read(args.get("tool_name", ""))
+        elif name in self._skill_handlers:
+            result = self._skill_handlers[name](args)
+        elif self._custom_skills.is_skill(name):
+            result = self._custom_skills.execute(name, args)
         else:
             result = {"error": f"Unknown tool: {name}"}
         compact_result = self._compact_tool_result_for_model(result)
@@ -1458,8 +2188,11 @@ class ServclawAgent:
             {"role": "system", "content": SYSTEM_CORE},
             {"role": "system", "content": SYSTEM_TOOL_RULES},
             {"role": "system", "content": SYSTEM_STYLE},
-            {"role": "system", "content": self.memory.get_memory_summary()},
         ]
+        if self._skill_guides:
+            skill_guide_block = "\n\n---\n\n".join(self._skill_guides)
+            messages.append({"role": "system", "content": f"## Skill Guides\n\n{skill_guide_block}"})
+        messages.append({"role": "system", "content": self.memory.get_memory_summary()})
         # When BOOTSTRAP.md exists the LLM has never been set up yet.
         # Only inject if this is truly a fresh session (no prior conversation).
         # If there are already messages, the user is mid-conversation and
@@ -1894,7 +2627,7 @@ class ServclawAgent:
         except Exception as e:
             return (f"Setup error: {str(e)}", True)
 
-    def chat(self, user_message: str, execution_id: str | None = None) -> Union[str, ConfirmationRequest]:
+    def chat(self, user_message: str, execution_id: str | None = None, msg_context: dict | None = None) -> Union[str, ConfirmationRequest]:
         """Process a user message using long-term memory + restored session context.
 
         Returns either:
@@ -1902,6 +2635,9 @@ class ServclawAgent:
           - ConfirmationRequest: agent wants to run a destructive command and
             needs user confirmation before proceeding
 
+        msg_context: optional metadata dict injected silently into the LLM context.
+          Keys: 'channel' (str), 'timestamp' (str ISO), 'user_id' (int|str),
+                'country' (str), 'city' (str), 'timezone' (str)
         On restart: agent has system prompt + memory/memory.md + memory/session.md + new messages.
         """
         self._set_current_execution_id(execution_id)
@@ -1915,6 +2651,9 @@ class ServclawAgent:
             # Autonomously update long-term memory via model-planned edit actions.
             actions = self._plan_memory_actions(user_message)
             self.memory.apply_memory_actions(actions)
+            # Side-effect: if memory recorded Country or City, sync to config so
+            # the scheduler can auto-derive the user's timezone for future jobs.
+            self._sync_location_to_config(actions)
 
             # Add user message to runtime history
             self.memory.add_message("user", user_message)
@@ -1931,6 +2670,29 @@ class ServclawAgent:
             # Tool-call traffic is kept transient and is never persisted into runtime history.
             self._clear_scratchpad()
             messages = self._build_base_messages()
+
+            # Silently inject incoming message metadata (channel, timestamp, user_id) when present.
+            # This is transient — never stored in memory or session history.
+            if msg_context:
+                parts = []
+                if ch := msg_context.get("channel"):
+                    parts.append(f"channel: {ch}")
+                if ts := msg_context.get("timestamp"):
+                    parts.append(f"time: {ts}")
+                if uid := msg_context.get("user_id"):
+                    parts.append(f"user_id: {uid}")
+                if country := msg_context.get("country"):
+                    parts.append(f"user_country: {country}")
+                if city := msg_context.get("city"):
+                    parts.append(f"user_city: {city}")
+                if tz := msg_context.get("timezone"):
+                    parts.append(f"user_timezone: {tz}")
+                if parts:
+                    messages.append({
+                        "role": "system",
+                        "content": f"[Incoming message context — {', '.join(parts)}]",
+                    })
+
             result = self._run_tool_loop(messages)
             
             # Promote important execution facts to long-term memory
@@ -1948,10 +2710,14 @@ class ServclawAgent:
             self._clear_current_execution_id()
 
     def _run_tool_loop(
-        self, messages: list[dict], approved_signatures: set[str] | None = None
+        self, messages: list[dict], approved_signatures: set[str] | None = None,
+        _tools_override: list | None = None,
     ) -> Union[str, ConfirmationRequest]:
         """Core LLM + tool execution loop. Resumable after confirmation."""
         approved_signatures = approved_signatures or set()
+        # Merge built-in tools with any currently loaded custom skill schemas.
+        base_tools = self._tools + self._custom_skills.get_schemas()
+        active_tools = _tools_override if _tools_override is not None else base_tools
         context_retry_used = False
         iteration = 0
         max_iterations = 30
@@ -2103,7 +2869,7 @@ class ServclawAgent:
                 response = self.client.chat.completions.create(
                     model=MODEL_NAME,
                     messages=llm_messages,
-                    tools=TOOLS,
+                    tools=active_tools,
                     tool_choice="auto",
                 )
             except Exception as exc:
