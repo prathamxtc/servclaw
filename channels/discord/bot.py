@@ -248,19 +248,36 @@ class ServclawDiscordClient(discord.Client):
         self._pending: dict[int, ConfirmationRequest] = {}
         self._active_executions: dict[int, str] = {}
         self._stopped_executions: set[str] = set()
+        self._dm_channels: dict[int, discord.DMChannel] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s (id=%s)", self.user, self.user.id)
         print(f"\n✓ Discord bot ready: {self.user}\n")
+        # Cache the running event loop so push_notification can schedule coroutines
+        # from non-async threads without relying on the deprecated client.loop property.
+        self._loop = asyncio.get_running_loop()
+        # Pre-fetch DM channels for all allowed users so push works even if they
+        # have never sent a message to the bot on Discord.
+        if self.allowed_user_ids:
+            for uid in self.allowed_user_ids:
+                try:
+                    user = await self.fetch_user(uid)
+                    dm = await user.create_dm()
+                    self._dm_channels.setdefault(uid, dm)
+                except Exception as exc:
+                    logger.warning("Could not pre-fetch DM channel for user %s: %s", uid, exc)
 
     def _is_execution_current(self, user_id: int, execution_id: str | None) -> bool:
         active = self._active_executions
         stopped = self._stopped_executions
-        return (
-            execution_id is not None
-            and active.get(user_id) == execution_id
-            and execution_id not in stopped
-        )
+        if execution_id is None:
+            return False
+        if execution_id in stopped:
+            return False
+        current = active.get(user_id)
+        # If current is missing, prefer delivering the response instead of dropping silently.
+        return current is None or current == execution_id
 
     async def on_message(self, message: discord.Message) -> None:
         # DMs only — ignore server messages
@@ -277,6 +294,9 @@ class ServclawDiscordClient(discord.Client):
             return
 
         content = (message.content or "").strip()
+
+        # Track DM channel for push notifications
+        self._dm_channels[user_id] = message.channel
 
         if content == "/stop":
             await self._cmd_stop(message)
@@ -373,8 +393,20 @@ class ServclawDiscordClient(discord.Client):
         execution_id = _new_execution_id(user_id)
         self._active_executions[user_id] = execution_id
         self.agent._status_callback = _make_status_callback(channel, loop)
+        cfg = load_config()
+        user_cfg = cfg.get("user", {})
+        msg_ctx = {
+            "channel": "discord",
+            "timestamp": message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "user_id": user_id,
+            "country": user_cfg.get("country"),
+            "city": user_cfg.get("city"),
+            "timezone": user_cfg.get("timezone"),
+        }
         try:
-            response = await loop.run_in_executor(None, self.agent.chat, user_text, execution_id)
+            response = await loop.run_in_executor(
+                None, lambda: self.agent.chat(user_text, execution_id, msg_ctx)
+            )
         except Exception:
             logger.exception("discord message handling failed")
             await channel.send(
@@ -387,14 +419,39 @@ class ServclawDiscordClient(discord.Client):
             self.agent._status_callback = None
 
         if not self._is_execution_current(user_id, execution_id):
+            current = self._active_executions.get(user_id)
+            logger.warning(
+                "Dropping stale Discord response user_id=%s old=%s current=%s",
+                user_id,
+                execution_id,
+                current,
+            )
             return
 
-        await _finish_response(channel, self, user_id, response)
+        try:
+            await _finish_response(channel, self, user_id, response)
+        except Exception:
+            logger.exception("discord final response delivery failed")
+            await _send_text(channel, response or "(no response)")
         if not isinstance(response, ConfirmationRequest):
             self._active_executions.pop(user_id, None)
 
+    def push_notification(self, text: str) -> None:
+        """Thread-safe: send text to all DM channels where allowed users have chatted."""
+        if not self.is_ready() or self._loop is None:
+            return
 
-def start_discord_bot(agent: Any) -> None:
+        async def _send_all() -> None:
+            for channel in list(self._dm_channels.values()):
+                try:
+                    await channel.send(text)
+                except Exception:
+                    pass
+
+        asyncio.run_coroutine_threadsafe(_send_all(), self._loop)
+
+
+def start_discord_bot(agent: Any, scheduler=None) -> None:
     cfg = load_config()
     token = get_discord_token(cfg)
     enabled = bool(cfg.get("channels", {}).get("discord", {}).get("enabled", True))
@@ -419,4 +476,7 @@ def start_discord_bot(agent: Any) -> None:
         print("! Discord allowlist is empty; all users are blocked until IDs are added.")
 
     client = ServclawDiscordClient(agent, allowed_user_ids)
+    if scheduler is not None:
+        scheduler.register_push_handler(client.push_notification)
+    agent.register_channel_push("discord", client.push_notification)
     client.run(token, log_handler=None)

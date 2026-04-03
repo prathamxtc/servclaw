@@ -153,7 +153,13 @@ def _new_execution_id(chat_id: int) -> str:
 def _is_execution_current(context: ContextTypes.DEFAULT_TYPE, chat_id: int, execution_id: str | None) -> bool:
     active = context.bot_data.setdefault("active_executions", {})
     stopped = context.bot_data.setdefault("stopped_executions", set())
-    return execution_id is not None and active.get(chat_id) == execution_id and execution_id not in stopped
+    if execution_id is None:
+        return False
+    if execution_id in stopped:
+        return False
+    current = active.get(chat_id)
+    # If current is missing, prefer delivering the response instead of dropping silently.
+    return current is None or current == execution_id
 
 
 async def _cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -313,8 +319,20 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     execution_id = _new_execution_id(chat_id)
     context.bot_data.setdefault("active_executions", {})[chat_id] = execution_id
     agent._status_callback = _make_status_callback(context, chat_id, loop)
+    cfg = load_config()
+    user_cfg = cfg.get("user", {})
+    msg_ctx = {
+        "channel": "telegram",
+        "timestamp": update.message.date.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "user_id": chat_id,
+        "country": user_cfg.get("country"),
+        "city": user_cfg.get("city"),
+        "timezone": user_cfg.get("timezone"),
+    }
     try:
-        response = await loop.run_in_executor(None, agent.chat, user_text, execution_id)
+        response = await loop.run_in_executor(
+            None, lambda: agent.chat(user_text, execution_id, msg_ctx)
+        )
     except Exception:
         logger.exception("telegram message handling failed")
         await update.message.reply_text(
@@ -327,9 +345,20 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         agent._status_callback = None
 
     if not _is_execution_current(context, chat_id, execution_id):
+        current = context.bot_data.setdefault("active_executions", {}).get(chat_id)
+        logger.warning(
+            "Dropping stale Telegram response chat_id=%s old=%s current=%s",
+            chat_id,
+            execution_id,
+            current,
+        )
         return
 
-    await _finish_response(update, context, response)
+    try:
+        await _finish_response(update, context, response)
+    except Exception:
+        logger.exception("telegram final response delivery failed")
+        await _send_text(context, chat_id, response or "(no response)")
     if not isinstance(response, ConfirmationRequest):
         context.bot_data.setdefault("active_executions", {}).pop(chat_id, None)
 
@@ -388,7 +417,7 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.exception("Unhandled Telegram error", exc_info=context.error)
 
 
-def start_telegram_bot(agent) -> None:
+def start_telegram_bot(agent, scheduler=None) -> None:
     cfg = load_config()
     token = get_telegram_token(cfg)
     enabled = bool(cfg.get("channels", {}).get("telegram", {}).get("enabled", True))
@@ -419,6 +448,38 @@ def start_telegram_bot(agent) -> None:
     app.bot_data["pending"] = {}
     app.bot_data["active_executions"] = {}
     app.bot_data["stopped_executions"] = set()
+    app.bot_data["known_chat_ids"] = set()
+
+    # In Telegram, user_id == chat_id for private/DM chats.
+    # Use allowedUserIds from config directly — no need to wait for the user to speak first.
+    _loop_ref: list[asyncio.AbstractEventLoop] = []
+
+    def push_notification(text: str) -> None:
+        if not _loop_ref:
+            logger.warning("push_notification: event loop not ready yet")
+            return
+        loop = _loop_ref[0]
+        target_ids = allowed_user_ids  # int set from config
+        if not target_ids:
+            logger.warning("push_notification: no allowedUserIds configured")
+            return
+
+        async def _send_all() -> None:
+            for chat_id in target_ids:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text)
+                except Exception as exc:
+                    logger.error("push_notification failed for chat_id=%s: %s", chat_id, exc)
+
+        future = asyncio.run_coroutine_threadsafe(_send_all(), loop)
+        try:
+            future.result(timeout=15)
+        except Exception as exc:
+            logger.error("push_notification future error: %s", exc)
+
+    if scheduler is not None:
+        scheduler.register_push_handler(push_notification)
+    agent.register_channel_push("telegram", push_notification)
 
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("clear", _cmd_clear))
@@ -430,6 +491,7 @@ def start_telegram_bot(agent) -> None:
     # run_polling() installs Unix signal handlers which only work on the main
     # thread.  We run in a daemon thread, so we drive the event loop manually.
     async def _run() -> None:
+        _loop_ref.append(asyncio.get_running_loop())
         await app.initialize()
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
