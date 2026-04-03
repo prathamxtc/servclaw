@@ -171,8 +171,14 @@ def main() -> None:
     from agent import ServclawAgent
     from channels.telegram.bot import start_telegram_bot
     from channels.discord.bot import start_discord_bot
+    from scheduler import Scheduler
 
     agent = ServclawAgent()
+
+    # Start the background scheduler and wire it to the agent.
+    scheduler = Scheduler(agent, agent._workspace_dir)
+    scheduler.start()
+    agent.scheduler = scheduler
 
     enable_terminal_repl = os.getenv("SERVCLAW_ENABLE_TERMINAL_REPL", "1").strip().lower() not in {
         "0",
@@ -186,7 +192,7 @@ def main() -> None:
     if get_telegram_token(cfg):
         t = threading.Thread(
             target=start_telegram_bot,
-            args=(agent,),
+            args=(agent, scheduler),
             daemon=True,
             name="telegram-bot",
         )
@@ -196,7 +202,7 @@ def main() -> None:
     if get_discord_token(cfg):
         t = threading.Thread(
             target=start_discord_bot,
-            args=(agent,),
+            args=(agent, scheduler),
             daemon=True,
             name="discord-bot",
         )
