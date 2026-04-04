@@ -54,6 +54,22 @@ The installer will:
 
 > If `servclaw` isn't found immediately, run `source ~/.profile` or open a new terminal.
 
+---
+
+## Updating
+
+To pull the latest changes on your server:
+
+```bash
+cd ~/servclaw   # or wherever you cloned it
+git pull
+bash install.sh
+```
+
+Running `install.sh` again is safe — it walks you through the setup steps again so you can enable new features (like new skills or channels) that weren't available when you first installed. It won't overwrite anything you've already configured unless you change it yourself.
+
+> **Important:** Do NOT delete the `workspace/` or `memory/` folders before or after updating. These hold the agent's identity, active jobs, and long-term memory. `git pull` does not touch them — they're excluded from the repo via `.gitignore`. Removing them resets the agent back to a blank state.
+
   
 
 ---
@@ -106,7 +122,9 @@ Skills are Python functions the agent can call as tools. You can add, update, or
 
 **Built-in skill: Tavily Web Search**
 
-Enable it during setup (or in `servclaw.json`) and the agent can search the web mid-conversation. Useful when you ask something it can't answer from memory alone.
+Enable it during setup and the agent can search the web mid-conversation — useful when you ask something it can't answer from memory alone.
+
+Tavily is a search API built for AI agents. Get a free API key at [app.tavily.com](https://app.tavily.com) — the installer will ask for it when you enable this skill. The key goes into `servclaw.json` under `secrets.tavilyApiKey`.
 
   
 
@@ -409,8 +427,6 @@ All excluded from git automatically.
   
 
 ---
-
-  
 
 ## Feedback & Contributions
 
